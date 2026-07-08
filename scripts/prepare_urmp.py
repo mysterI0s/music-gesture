@@ -121,7 +121,11 @@ def run_alphapose(frames_dir, args):
     cmd = ["python", demo, "--cfg", args.ap_cfg, "--checkpoint", args.ap_ckpt,
            "--indir", frames_dir, "--outdir", outdir, "--sp",
            "--detector", args.ap_detector, "--gpus", args.ap_gpus]
-    subprocess.run(cmd, check=True, cwd=args.alphapose_root)
+    # Make the alphapose package importable even without a pip install
+    # (a plain `setup.py build_ext --inplace` is enough).
+    env = os.environ.copy()
+    env["PYTHONPATH"] = args.alphapose_root + os.pathsep + env.get("PYTHONPATH", "")
+    subprocess.run(cmd, check=True, cwd=args.alphapose_root, env=env)
     return os.path.join(outdir, "alphapose-results.json")
 
 
