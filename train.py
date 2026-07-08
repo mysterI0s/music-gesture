@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import shutil
 
 import numpy as np
 import torch
@@ -91,20 +92,30 @@ def main():
     criterion = nn.L1Loss() if cfg["audio"]["mask_type"] == "ratio" else nn.BCELoss()
 
     start_epoch = 0
+    best_loss = float("inf")
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
+        best_loss = ckpt.get("best_loss", float("inf"))
 
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
         loss = train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch)
         scheduler.step()
         print(f"epoch {epoch} done avg_loss {loss:.4f}")
-        if epoch % cfg["train"]["ckpt_interval"] == 0:
-            path = os.path.join(cfg["experiment"]["output_dir"], f"epoch_{epoch}.pth")
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                        "epoch": epoch, "cfg": cfg}, path)
+        # Keep only a rolling last.pth (+ best.pth) so /kaggle/working does not
+        # fill up with one ~150MB file per epoch. Atomic write via tmp+rename.
+        out_dir = cfg["experiment"]["output_dir"]
+        state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                 "epoch": epoch, "best_loss": min(best_loss, loss), "cfg": cfg}
+        tmp = os.path.join(out_dir, "last.pth.tmp")
+        torch.save(state, tmp)
+        os.replace(tmp, os.path.join(out_dir, "last.pth"))
+        if loss < best_loss:
+            best_loss = loss
+            shutil.copyfile(os.path.join(out_dir, "last.pth"),
+                            os.path.join(out_dir, "best.pth"))
 
 
 if __name__ == "__main__":
