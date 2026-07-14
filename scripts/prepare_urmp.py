@@ -399,12 +399,16 @@ def segment_and_write(name, players, frame_paths, args, writer):
                 if len(pose) < seg_frames:
                     pose = np.pad(pose, ((0, seg_frames - len(pose)), (0, 0), (0, 0)))
             np.save(os.path.join(pose_dir, clip + ".npy"), pose.astype(np.float32))
-            # context frame (middle of segment)
-            mid = f0 + seg_frames // 2
-            if args.pose != "zeros" and p["crops"] and p["crops"][mid]:
-                src_img = p["crops"][mid]
+            # context frame: first frame of the segment (paper) or its middle.
+            if args.context_frame == "first":
+                ctx_idx = f0
             else:
-                src_img = frame_paths[min(mid, len(frame_paths) - 1)]
+                ctx_idx = f0 + seg_frames // 2
+            ctx_idx = min(ctx_idx, len(frame_paths) - 1)
+            if args.pose != "zeros" and p["crops"] and p["crops"][ctx_idx]:
+                src_img = p["crops"][ctx_idx]
+            else:
+                src_img = frame_paths[ctx_idx]
             img = cv2.imread(src_img)
             img = cv2.resize(img, (args.frame_size, args.frame_size))
             cv2.imwrite(os.path.join(ctx_dir, clip + ".jpg"), img)
@@ -423,6 +427,9 @@ def main():
     ap.add_argument("--num_frames", type=int, default=48)
     ap.add_argument("--frame_size", type=int, default=224)
     ap.add_argument("--seg_hop", type=float, default=6.0)
+    ap.add_argument("--context_frame", choices=["first", "middle"], default="middle",
+                    help="which segment frame to use as the semantic context crop "
+                         "(paper uses the first frame)")
     ap.add_argument("--max_people", type=int, default=5)
     ap.add_argument("--pose_stride", type=int, default=1,
                     help="run MediaPipe every Nth frame and interpolate the rest")

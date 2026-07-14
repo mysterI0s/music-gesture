@@ -1,0 +1,111 @@
+# Music Gesture - PAPER-FAITHFUL configuration.
+#
+# This config flips every architecture/training flag to the value described in
+# the CVPR 2020 paper. It is meant for reproducing the paper as closely as the
+# (partially under-specified) description allows, not for the most efficient
+# training on limited hardware. See docs/ARCHITECTURE.md for the flag table.
+#
+# NOTE: some paper values are ambiguous in the text; those are annotated below.
+
+experiment:
+  name: music_gesture_paper_faithful
+  seed: 1234
+  output_dir: runs
+
+data:
+  root: datasets/processed
+  train_index: datasets/processed/train.csv
+  val_index: datasets/processed/val.csv
+  num_mix: 2
+  categories: 21
+  mix_policy: random        # overridden per-stage by the curriculum below
+
+audio:
+  sample_rate: 11025
+  clip_seconds: 6.0
+  n_fft: 1022
+  hop_length: 256
+  win_length: 1022
+  n_freq: 512
+  log_freq: true
+  n_log_freq: 256
+  mask_type: binary
+  mask_target: literal_mix        # paper Eq. 4: S_k >= S_mix
+  loss_mode: bce_plain            # paper: plain per-pixel BCE
+  mask_threshold: 0.5
+  loss_energy_floor: 0.0          # unused under bce_plain
+  clip_grad: 5.0
+
+video:
+  fps: 8
+  num_frames: 48
+  frame_size: 224
+  body_joints: 18
+  hand_joints: 21
+  num_people_max: 2
+  pose_augment: true              # paper applies keypoint augmentation
+  pose_jitter_translate: 0.05
+  pose_jitter_scale: 0.1
+  pose_jitter_rotate_deg: 10.0
+
+model:
+  audio:
+    ngf: 64
+    num_downs: 4                  # paper: 4 downsampling + 4 upsampling
+    input_nc: 1
+    output_nc: 1
+    conv_kernel: 3                # paper: 3x3
+    up_kernel: 3
+    dilation: 1                   # paper text contradictory ("dilated ... dilation 1")
+  context:
+    backbone: resnet50
+    pretrained: true
+    feat_dim: 2048                # paper: raw 2048-d ResNet-50 feature (no projection)
+  pose:
+    in_channels: 3
+    # paper: 11-layer CT-GCN
+    graph_layers: [64, 64, 64, 128, 128, 128, 256, 256, 256, 256, 256]
+    stride_layers: [3, 6]         # temporal downsample at the 128 and 256 transitions
+    temporal_kernel: 9
+    dropout: 0.1
+    embed_dim: 512
+    context_mode: concat          # paper: concat context onto node features
+  fusion:
+    dim: 512
+    depth: 3
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    mode: paper_attn              # paper: sound queries attend to visual features
+
+train:
+  batch_size: 8
+  num_workers: 4
+  epochs: 100
+  lr: 0.001                       # unused under sgd (see param_groups)
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  lr_steps: [40, 80]
+  lr_gamma: 0.1
+  optimizer: sgd                  # paper: SGD momentum 0.9
+  momentum: 0.9
+  param_groups:
+    audio_fusion: 0.01            # paper: 1e-2
+    gcn_appearance: 0.001         # paper: 1e-3
+  log_interval: 20
+  ckpt_interval: 1
+  # Paper two-stage curriculum: pretrain on easy hetero-musical mixtures, then
+  # finetune on the hard homo-musical (same-instrument) mixtures.
+  stages:
+    - name: pretrain_hetero
+      mix_policy: hetero
+      epochs: 60
+      lr_steps: [30, 50]
+    - name: finetune_homo
+      mix_policy: homo
+      epochs: 40
+      lr_steps: [20, 35]
+      lr_scale: 0.1
+
+eval:
+  metrics: [sdr, sir, sar]

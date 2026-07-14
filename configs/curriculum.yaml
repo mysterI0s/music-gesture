@@ -1,0 +1,108 @@
+# Music Gesture - two-stage curriculum (paper Sec. 4).
+#
+# Keeps the repo's efficient default architecture but adds the paper's
+# hetero-musical -> homo-musical training curriculum on top of the URMP setup.
+# Stage 0 pretrains on mixtures of *different* instruments (easy); stage 1
+# finetunes on *same*-instrument mixtures (the hard homo-musical case) starting
+# from the stage-0 weights at 0.1x LR. Each stage writes its own subfolder under
+# experiment.output_dir and the final checkpoint is copied to runs/last.pth.
+
+experiment:
+  name: music_gesture_curriculum
+  seed: 1234
+  output_dir: runs
+
+data:
+  root: datasets/processed
+  train_index: datasets/processed/train.csv
+  val_index: datasets/processed/val.csv
+  num_mix: 2
+  categories: 13
+  mix_policy: random        # overridden per-stage below
+
+audio:
+  sample_rate: 11025
+  clip_seconds: 6.0
+  n_fft: 1022
+  hop_length: 256
+  win_length: 1022
+  n_freq: 512
+  log_freq: true
+  n_log_freq: 256
+  mask_type: binary
+  mask_target: dominant
+  loss_mode: bce_energy_weighted
+  mask_threshold: 0.7
+  loss_energy_floor: 0.02
+  clip_grad: 5.0
+
+video:
+  fps: 8
+  num_frames: 48
+  frame_size: 224
+  body_joints: 18
+  hand_joints: 21
+  num_people_max: 2
+  pose_augment: true
+  pose_jitter_translate: 0.05
+  pose_jitter_scale: 0.1
+  pose_jitter_rotate_deg: 10.0
+
+model:
+  audio:
+    ngf: 64
+    num_downs: 7
+    input_nc: 1
+    output_nc: 1
+    conv_kernel: 4
+    up_kernel: 4
+    dilation: 1
+  context:
+    backbone: resnet50
+    pretrained: true
+    feat_dim: 512
+  pose:
+    in_channels: 3
+    graph_layers: [64, 64, 64, 128, 128, 256]
+    stride_layers: [2, 4]
+    temporal_kernel: 9
+    dropout: 0.1
+    embed_dim: 512
+    context_mode: film
+  fusion:
+    dim: 512
+    depth: 3
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    mode: transformer
+
+train:
+  batch_size: 8
+  num_workers: 2
+  epochs: 40                # per-stage default; overridden by stages below
+  lr: 0.001
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  lr_steps: [25, 35]
+  lr_gamma: 0.1
+  optimizer: adam
+  momentum: 0.9
+  param_groups:
+    audio_fusion: 0.01
+    gcn_appearance: 0.001
+  log_interval: 20
+  ckpt_interval: 1
+  stages:
+    - name: pretrain_hetero
+      mix_policy: hetero
+      epochs: 30
+      lr_steps: [18, 26]
+    - name: finetune_homo
+      mix_policy: homo
+      epochs: 20
+      lr_steps: [12, 17]
+      lr_scale: 0.1
+
+eval:
+  metrics: [sdr, sir, sar]

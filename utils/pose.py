@@ -106,3 +106,34 @@ def normalize_keypoints(kp: np.ndarray, frame_w: int, frame_h: int) -> np.ndarra
     out[..., 0] = out[..., 0] / frame_w * 2 - 1
     out[..., 1] = out[..., 1] / frame_h * 2 - 1
     return np.transpose(out, (2, 0, 1))
+
+
+def augment_keypoints(kp: np.ndarray, translate: float = 0.05,
+                      scale: float = 0.1, rotate_deg: float = 10.0,
+                      rng=None) -> np.ndarray:
+    """Random rigid + scale jitter of the (x, y) coordinates for training.
+
+    Paper Sec. 4 (implementation details) applies keypoint augmentation. The
+    same random rotation / scale / translation is applied to every frame of a
+    clip (temporally consistent) and only to channels 0-1; the confidence
+    channel is left untouched.
+
+    kp: [3, T, V] already normalized to [-1, 1] (output of normalize_keypoints).
+    """
+    if rng is None:
+        rng = np.random
+    out = kp.astype(np.float32).copy()
+    x = out[0]
+    y = out[1]
+    theta = np.deg2rad(rng.uniform(-rotate_deg, rotate_deg))
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    xr = cos_t * x - sin_t * y
+    yr = sin_t * x + cos_t * y
+    s = 1.0 + rng.uniform(-scale, scale)
+    xr *= s
+    yr *= s
+    xr += rng.uniform(-translate, translate)
+    yr += rng.uniform(-translate, translate)
+    out[0] = xr
+    out[1] = yr
+    return out

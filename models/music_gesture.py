@@ -2,6 +2,11 @@
 
 Given a mixture spectrogram and, for each source, that source's keypoints and a
 context crop, predict one separation mask per source.
+
+Architectural variants (context conditioning, U-Net depth/kernel, fusion
+scheme, GCN depth/strides, context width) are all driven by the config so the
+same class can instantiate either the repo's efficient default or the
+paper-faithful configuration (see configs/paper_faithful.yaml).
 """
 from __future__ import annotations
 
@@ -23,11 +28,14 @@ class MusicGesture(nn.Module):
         super().__init__()
         m = cfg["model"]
         dim = m["fusion"]["dim"]
+        a = m["audio"]
 
         self.audio_net = AudioUNet(
-            ngf=m["audio"]["ngf"], num_downs=m["audio"]["num_downs"],
-            input_nc=m["audio"]["input_nc"], output_nc=m["audio"]["output_nc"],
+            ngf=a["ngf"], num_downs=a["num_downs"],
+            input_nc=a["input_nc"], output_nc=a["output_nc"],
             bottleneck_dim=dim,
+            conv_kernel=a.get("conv_kernel", 4), up_kernel=a.get("up_kernel", 4),
+            dilation=a.get("dilation", 1),
         )
         self.context_net = ContextNet(
             backbone=m["context"]["backbone"], pretrained=m["context"]["pretrained"],
@@ -38,10 +46,13 @@ class MusicGesture(nn.Module):
             temporal_kernel=m["pose"]["temporal_kernel"], context_dim=m["context"]["feat_dim"],
             embed_dim=m["pose"]["embed_dim"], dropout=m["pose"]["dropout"],
             body_joints=cfg["video"]["body_joints"], hand_joints=cfg["video"]["hand_joints"],
+            context_mode=m["pose"].get("context_mode", "film"),
+            stride_layers=tuple(m["pose"].get("stride_layers", (2, 4))),
         )
         self.fusion = AudioVisualFusion(
             dim=dim, depth=m["fusion"]["depth"], heads=m["fusion"]["heads"],
             mlp_ratio=m["fusion"]["mlp_ratio"], dropout=m["fusion"]["dropout"],
+            fusion_mode=m["fusion"].get("mode", "transformer"),
         )
         self.mask_head = MaskHead(mask_type=cfg["audio"]["mask_type"])
 

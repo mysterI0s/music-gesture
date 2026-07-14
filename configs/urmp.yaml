@@ -14,6 +14,7 @@ data:
   val_index: datasets/processed/val.csv
   num_mix: 2                # N in Mix-and-Separate (paper trains with 2)
   categories: 13            # URMP has 13 instrument classes
+  mix_policy: random        # {random, hetero, homo} partner-selection for mixing
 
 audio:
   sample_rate: 11025
@@ -25,6 +26,8 @@ audio:
   log_freq: true            # warp to log-frequency scale
   n_log_freq: 256
   mask_type: binary         # {binary, ratio} - MG uses a binary IBM + per-pixel BCE
+  mask_target: dominant     # {dominant, literal_mix} binary-mask target (paper Eq.4 = literal_mix)
+  loss_mode: bce_energy_weighted  # {bce_energy_weighted, bce_plain} (paper = bce_plain)
   mask_threshold: 0.7       # inference threshold to binarise the predicted mask (paper)
   loss_energy_floor: 0.02   # BCE ignores T-F bins below this fraction of per-sample peak magnitude
   clip_grad: 5.0
@@ -36,6 +39,10 @@ video:
   body_joints: 18           # OpenPose COCO body
   hand_joints: 21           # per hand
   num_people_max: 2
+  pose_augment: false       # random keypoint jitter on the train split (paper)
+  pose_jitter_translate: 0.05
+  pose_jitter_scale: 0.1
+  pose_jitter_rotate_deg: 10.0
 
 model:
   audio:
@@ -43,22 +50,28 @@ model:
     num_downs: 7
     input_nc: 1
     output_nc: 1
+    conv_kernel: 4          # encoder conv kernel (paper = 3)
+    up_kernel: 4            # decoder transposed-conv kernel (paper = 3)
+    dilation: 1             # documented knob only; paper text is contradictory
   context:
     backbone: resnet50
     pretrained: true
-    feat_dim: 512
+    feat_dim: 512           # paper keeps the raw 2048-d ResNet-50 feature
   pose:
     in_channels: 3          # (x, y, confidence)
     graph_layers: [64, 64, 64, 128, 128, 256]
+    stride_layers: [2, 4]   # block indices that downsample in time
     temporal_kernel: 9
     dropout: 0.1
     embed_dim: 512
+    context_mode: film      # {film, concat} context conditioning (paper = concat)
   fusion:
     dim: 512
     depth: 3
     heads: 8
     mlp_ratio: 4.0
     dropout: 0.1
+    mode: transformer       # {transformer, paper_attn} fusion scheme (paper = paper_attn)
 
 train:
   batch_size: 8             # fits T4 16GB with the F/T-padded U-Net
@@ -69,6 +82,11 @@ train:
   weight_decay: 0.0001
   lr_steps: [25, 35]        # decay LR within the 40-epoch run
   lr_gamma: 0.1
+  optimizer: adam           # {adam, sgd}; sgd = paper (momentum 0.9)
+  momentum: 0.9
+  param_groups:             # only used when optimizer == sgd
+    audio_fusion: 0.01      # paper: 1e-2 for audio-separation U-Net + fusion
+    gcn_appearance: 0.001   # paper: 1e-3 for ST-GCN + appearance (context) net
   log_interval: 20
   ckpt_interval: 1
 

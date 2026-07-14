@@ -48,6 +48,17 @@ def ideal_binary_mask(source_mag: torch.Tensor,
     return (source_mag >= other_mag).float()
 
 
+def ideal_binary_mask_literal(source_mag: torch.Tensor,
+                              mixture_mag: torch.Tensor) -> torch.Tensor:
+    """Literal reading of Music Gesture Eq. 4: 1 where the source is at least
+    as loud as the *mixture* itself (S_k >= S_mix), rather than the dominant
+    source among the others. Because the mixture is the sum of magnitudes, this
+    target is only 1 where a single source overwhelmingly dominates, so the
+    labels are sparse. Selectable via ``audio.mask_target: literal_mix``.
+    """
+    return (source_mag >= mixture_mag).float()
+
+
 def mix_and_separate(waveforms: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """Given N solo waveforms, return (mixture, sources).
 
