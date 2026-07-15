@@ -55,7 +55,7 @@ model:
     ngf: 64
     num_downs: 4                  # paper: 4 downsampling + 4 upsampling
     input_nc: 1
-    output_nc: 1
+    output_nc: 32                   # synthesizer feature-map channels; vision-gated head combines them -> 1 mask
     conv_kernel: 3                # paper: 3x3
     up_kernel: 3
     dilation: 1                   # paper text contradictory ("dilated ... dilation 1")

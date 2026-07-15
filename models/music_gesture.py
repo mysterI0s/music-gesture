@@ -57,6 +57,14 @@ class MusicGesture(nn.Module):
             fusion_mode=m["fusion"].get("mode", "transformer"),
         )
         self.mask_head = MaskHead(mask_type=cfg["audio"]["mask_type"])
+        # Vision-gated output head (Sound-of-Pixels / Music Gesture synthesizer).
+        # The decoder emits `synth_channels` feature maps; the per-source visual
+        # embedding is projected to per-channel weights that combine them into the
+        # mask. This gives the visual signal a DIRECT, per-pixel path to the
+        # output instead of only entering the (skip-bypassed) bottleneck.
+        self.synth_channels = a["output_nc"]
+        self.vis_gate_w = nn.Linear(dim, self.synth_channels)
+        self.vis_gate_b = nn.Linear(dim, 1)
 
     def separate_one(self, spec: torch.Tensor, keypoints: torch.Tensor,
                      context_frame: torch.Tensor) -> torch.Tensor:
@@ -76,10 +84,17 @@ class MusicGesture(nn.Module):
             spec = F.pad(spec, (0, pad_t, 0, pad_f))
         audio_tokens, hw, skips = self.audio_net.encode(spec)
         context = self.context_net(context_frame)
-        gesture_tokens = self.pose_net(keypoints, context)
-        fused = self.fusion(audio_tokens, gesture_tokens)
-        logits = self.audio_net.decode(fused, hw, skips)
-        logits = logits[..., :Fdim, :Tdim]  # crop back to the true spectrogram size
+        gesture_tokens = self.pose_net(keypoints, context)   # [B, T', D]
+        fused = self.fusion(audio_tokens, gesture_tokens)    # paper cross-modal attn
+        featmap = self.audio_net.decode(fused, hw, skips)    # [B, K, F, T]
+        featmap = featmap[..., :Fdim, :Tdim]  # crop back to the true spectrogram size
+        # Vision-gated combination: pool the gesture tokens into one per-source
+        # visual vector and use it to weight the K synthesizer channels per pixel.
+        vis_vec = gesture_tokens.mean(dim=1)                 # [B, D]
+        w = self.vis_gate_w(vis_vec)                          # [B, K]
+        b = self.vis_gate_b(vis_vec)                          # [B, 1]
+        logits = torch.einsum("bkft,bk->bft", featmap, w) + b.unsqueeze(-1)  # [B, F, T]
+        logits = logits.unsqueeze(1)                          # [B, 1, F, T]
         return self.mask_head(logits)
 
     def forward(self, mixture_spec: torch.Tensor,
