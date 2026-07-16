@@ -1,0 +1,137 @@
+# Music Gesture - PAPER-FAITHFUL configuration, on the URMP dataset.
+# MULTI-GPU VARIANT (e.g. Kaggle free tier's 2x T4).
+#
+# This is IDENTICAL to configs/urmp_paper_faithful.yaml except that it turns on
+# train.data_parallel. Every hyperparameter (batch size, LR groups, schedule,
+# curriculum, seed) is unchanged, so the optimization is the same as the 1-GPU
+# run -- you just get the throughput of N GPUs. The GLOBAL batch stays 8 and is
+# split across the visible GPUs (4/GPU on 2x T4), which keeps results directly
+# comparable to the single-GPU config. Checkpoints are saved in the exact same
+# format and are interchangeable with the 1-GPU config, eval_diag.py, and
+# scripts/resume_stage1.py.
+# To reproduce the original single-GPU result, just use urmp_paper_faithful.yaml
+# (or set data_parallel: false below).
+#
+# Same architecture/training choices as configs/paper_faithful.yaml (every flag
+# set to the value described in the CVPR 2020 paper), but adapted to URMP:
+#   - data.categories: 13 (URMP instrument count)
+#   - URMP-scale batch size / LR schedule
+# Reads the same datasets/processed layout you already built for configs/urmp.yaml
+# (audio + pose + frames + meta.csv + train.csv/val.csv). No re-preprocessing.
+#
+# NOTE: some paper values are ambiguous in the text; those are annotated below.
+
+experiment:
+  name: music_gesture_urmp_paper_faithful_multigpu
+  seed: 1234
+  output_dir: runs
+
+data:
+  root: datasets/processed
+  train_index: datasets/processed/train.csv
+  val_index: datasets/processed/val.csv
+  num_mix: 2
+  categories: 13            # URMP instrument count
+  mix_policy: random        # overridden per-stage by the curriculum below
+
+audio:
+  sample_rate: 11025
+  clip_seconds: 6.0
+  n_fft: 1022
+  hop_length: 256
+  win_length: 1022
+  n_freq: 512
+  log_freq: true
+  n_log_freq: 256
+  mask_type: binary
+  mask_target: dominant           # Eq. 4 as dominant-source IBM (literal S_k>=S_mix oracle-caps at ~4.5 dB)
+  loss_mode: bce_energy_weighted  # weight bins by energy so silent bins don't dominate the gradient
+  mask_threshold: 0.5
+  loss_energy_floor: 0.1          # ignore bins below 10% of each clip's peak magnitude
+  clip_grad: 5.0
+
+video:
+  fps: 8
+  num_frames: 48
+  frame_size: 224
+  body_joints: 18
+  hand_joints: 21
+  num_people_max: 2
+  pose_augment: true              # paper applies keypoint augmentation
+  pose_jitter_translate: 0.05
+  pose_jitter_scale: 0.1
+  pose_jitter_rotate_deg: 10.0
+
+model:
+  audio:
+    ngf: 64
+    num_downs: 4                  # paper: 4 downsampling + 4 upsampling
+    input_nc: 1
+    output_nc: 32                   # synthesizer feature-map channels; vision-gated head combines them -> 1 mask
+    conv_kernel: 3                # paper: 3x3
+    up_kernel: 3
+    dilation: 1                   # paper text contradictory ("dilated ... dilation 1")
+  context:
+    backbone: resnet50
+    pretrained: true
+    feat_dim: 2048                # paper: raw 2048-d ResNet-50 feature (no projection)
+  pose:
+    in_channels: 3
+    # paper: 11-layer CT-GCN
+    graph_layers: [64, 64, 64, 128, 128, 128, 256, 256, 256, 256, 256]
+    stride_layers: [3, 6]         # temporal downsample at the 128 and 256 transitions
+    temporal_kernel: 9
+    dropout: 0.1
+    embed_dim: 512
+    context_mode: concat          # paper: concat context onto node features
+    # P2: concatenate context onto ENCODED node features (after 1 graph block),
+    # not the raw (x,y,conf) coords, and project the 2048-d context down to 128
+    # so it does not drown the keypoint channels. Set context_inject_after: 0 and
+    # context_proj_dim: 0 to restore the old raw-input, unprojected concat.
+    context_inject_after: 1
+    context_proj_dim: 128
+  fusion:
+    dim: 512
+    depth: 3
+    heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    mode: paper_attn              # paper: sound queries attend to visual features
+
+train:
+  batch_size: 8                   # URMP-scale GLOBAL batch (split across GPUs)
+  num_workers: 4
+  # ---- Multi-GPU (nn.DataParallel) ----
+  # data_parallel: true wraps the model in nn.DataParallel when >1 CUDA device
+  # is visible; on a single GPU it transparently falls back to normal training.
+  # gpu_ids: null uses every visible GPU; set e.g. [0, 1] to pin specific ones.
+  data_parallel: true
+  gpu_ids: null
+  epochs: 40
+  lr: 0.001                       # unused under sgd (see param_groups)
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  lr_steps: [25, 35]              # URMP schedule
+  lr_gamma: 0.1
+  optimizer: sgd                  # paper: SGD momentum 0.9
+  momentum: 0.9
+  param_groups:
+    audio_fusion: 0.01            # paper: 1e-2
+    gcn_appearance: 0.001         # paper: 1e-3
+  log_interval: 20
+  ckpt_interval: 1
+  # Paper two-stage curriculum: pretrain on easy hetero-musical mixtures, then
+  # finetune on the hard homo-musical (same-instrument) mixtures.
+  stages:
+    - name: pretrain_hetero
+      mix_policy: hetero
+      epochs: 30
+      lr_steps: [18, 26]
+    - name: finetune_homo
+      mix_policy: homo
+      epochs: 20
+      lr_steps: [12, 17]
+      lr_scale: 0.1
+
+eval:
+  metrics: [sdr, sir, sar]
