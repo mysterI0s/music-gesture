@@ -145,33 +145,6 @@ def build_optimizer(model, cfg):
     return torch.optim.Adam(params, weight_decay=wd)
 
 
-def _wrap_data_parallel(model, cfg, device):
-    """Optionally wrap ``model`` in ``nn.DataParallel`` for multi-GPU training.
-
-    Enabled only when ``train.data_parallel`` is true, CUDA is available, and
-    more than one GPU is visible (e.g. Kaggle's free 2x T4). ``train.gpu_ids``
-    may pin specific device ids; ``null`` uses every visible CUDA device.
-
-    When disabled (the default) the model is returned unchanged, so single-GPU
-    runs stay byte-for-byte identical to before. DataParallel is transparent to
-    the training loop: it scatters the batch (and the per-source keypoint/
-    context lists) across GPUs along dim 0 and gathers the per-source mask list
-    back onto the primary device, where the loss is computed exactly as before.
-    """
-    tcfg = cfg["train"]
-    if not tcfg.get("data_parallel", False):
-        return model
-    if device.type != "cuda" or torch.cuda.device_count() < 2:
-        n = torch.cuda.device_count() if device.type == "cuda" else 0
-        print(f"[data_parallel] requested but only {n} CUDA device(s) visible; "
-              "running on a single device (results match the 1-GPU config).")
-        return model
-    gpu_ids = tcfg.get("gpu_ids") or list(range(torch.cuda.device_count()))
-    print(f"[data_parallel] DataParallel across {len(gpu_ids)} GPUs {gpu_ids}; "
-          f"global batch {tcfg['batch_size']} split ~{tcfg['batch_size'] // len(gpu_ids)}/GPU")
-    return nn.DataParallel(model, device_ids=gpu_ids)
-
-
 def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch):
     model.train()
     running = 0.0
@@ -219,18 +192,7 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
                         drop_last=True)
 
     model = MusicGesture(cfg).to(device)
-    # Build the optimizer on the raw module BEFORE any DataParallel wrapping so
-    # the SGD param-group name matching ("audio_net."/"fusion." ...) and the
-    # model.context_net lookup keep working. The parameters are shared, so the
-    # optimizer stays correct after wrapping.
     optimizer = build_optimizer(model, cfg)
-
-    # Optional multi-GPU data parallelism (opt-in via train.data_parallel).
-    # ``raw_model`` is always the underlying MusicGesture module: we save/load
-    # its state_dict so checkpoints stay identical to single-GPU runs and load
-    # cleanly in eval_diag.py / resume_stage1.py (no "module." prefix).
-    raw_model = model
-    model = _wrap_data_parallel(model, cfg, device)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg["train"]["lr_steps"], gamma=cfg["train"]["lr_gamma"])
     criterion = nn.L1Loss() if cfg["audio"]["mask_type"] == "ratio" else nn.BCELoss()
@@ -239,11 +201,11 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
     best_loss = float("inf")
     if init_from and os.path.isfile(init_from):
         ckpt = torch.load(init_from, map_location=device)
-        raw_model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"])
         print(f"[init] loaded model weights from {init_from}")
     if resume and os.path.isfile(resume):
         ckpt = torch.load(resume, map_location=device)
-        raw_model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("best_loss", float("inf"))
@@ -255,7 +217,7 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
         print(f"epoch {epoch} done avg_loss {loss:.4f}")
         # Keep only a rolling last.pth (+ best.pth) so the output dir does not
         # fill up with one ~150MB file per epoch. Atomic write via tmp+rename.
-        state = {"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
+        state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                  "epoch": epoch, "best_loss": min(best_loss, loss), "cfg": cfg}
         tmp = os.path.join(out_dir, "last.pth.tmp")
         torch.save(state, tmp)

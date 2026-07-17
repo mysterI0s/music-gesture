@@ -27,7 +27,7 @@ Each MUSIC-21 solo has ONE musician, so -- unlike URMP -- we keep the single
 highest-confidence detected person per frame (no player<->stem matching).
 """
 from __future__ import annotations
-import argparse, csv, glob, json, os, subprocess, urllib.request
+import argparse, csv, glob, json, os, shutil, subprocess, urllib.request
 from collections import defaultdict
 import numpy as np
 
@@ -382,6 +382,55 @@ def segment_and_write(name, category, video, frame_paths, pose, crops, args, wri
     return written
 
 
+def cleanup_tmp(name, args):
+    """Remove all per-video temp artifacts (extracted frames, crops, AlphaPose
+    json, resampled wav) so streaming preprocessing keeps disk usage bounded."""
+    shutil.rmtree(os.path.join(args.tmp, "frames", name), ignore_errors=True)
+    shutil.rmtree(os.path.join(args.tmp, "_ap", name), ignore_errors=True)
+    try:
+        os.remove(os.path.join(args.tmp, name + ".wav"))
+    except OSError:
+        pass
+
+
+def process_one(vi, total, category, video, args, detectors, writer):
+    """Extract pose/audio/frames for a single video and append its clips.
+    Never raises: a corrupt or undecodable video is skipped and 0 is returned."""
+    name = os.path.splitext(os.path.basename(video))[0]
+    # Skip corrupt / truncated downloads (yt-dlp sometimes reports success for a
+    # broken file that ffmpeg cannot decode).
+    try:
+        size = os.path.getsize(video)
+    except OSError:
+        size = 0
+    if size < 200 * 1024:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (bad download, {size} bytes)")
+        return 0
+    try:
+        if args.pose == "alphapose":
+            frames, pose, crops = extract_video_alphapose(video, args)
+        elif args.pose == "mediapipe":
+            frames, pose, crops = extract_video_mediapipe(video, args, detectors)
+        else:
+            # zeros: still need frames for context + timing
+            frames_dir = os.path.join(args.tmp, "frames", name)
+            os.makedirs(frames_dir, exist_ok=True)
+            if not glob.glob(os.path.join(frames_dir, "*.jpg")):
+                sh(["ffmpeg", "-y", "-i", video, "-vf",
+                    f"fps={args.fps},scale=-2:480", os.path.join(frames_dir, "%06d.jpg")])
+            frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+            pose, crops = None, None
+    except Exception as e:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped ({type(e).__name__}: {e})")
+        return 0
+    if not frames:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no frames)")
+        return 0
+    n = segment_and_write(name, category, video, frames, pose, crops, args, writer)
+    print(f"[{vi+1}/{total}] {category}/{name}: {n} clips")
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default="", help="MUSIC21 solo videos JSON (for --download and category filtering)")
@@ -402,6 +451,9 @@ def main():
     ap.add_argument("--max_per_cat", type=int, default=0, help="0 = all ids per category (download)")
     ap.add_argument("--max_videos", type=int, default=0, help="0 = all videos (preprocess)")
     ap.add_argument("--dl_height", type=int, default=480)
+    ap.add_argument("--keep_videos", action="store_true",
+                    help="keep source videos on disk (default: delete each after "
+                         "processing so the full set fits without overflowing disk)")
     # AlphaPose (RMPE) backend -- paper-faithful GPU wholebody keypoints.
     ap.add_argument("--alphapose_root", default="/kaggle/working/AlphaPose")
     ap.add_argument("--ap_cfg",
@@ -420,29 +472,16 @@ def main():
         os.makedirs(os.path.join(args.out, d), exist_ok=True)
 
     cat_ids = load_solo_json(args.json) if args.json else None
-    if args.download:
-        if not cat_ids:
-            raise SystemExit("--download requires --json")
-        os.makedirs(args.videos_root, exist_ok=True)
-        print("downloading videos with yt-dlp ...")
-        download_videos(cat_ids, args.videos_root, max_per_cat=args.max_per_cat,
-                        height=args.dl_height, cookiefile=args.cookiefile or None)
 
-    videos = find_videos_by_category(args.videos_root, cat_ids)
-    if args.max_videos:
-        videos = videos[:args.max_videos]
-    if not videos:
-        raise SystemExit(f"no videos found under {args.videos_root}")
+    detectors = None
+    if args.pose == "mediapipe":
+        detectors = build_mp_detectors(args.tmp)
+
     tag = ""
     if args.pose == "alphapose":
         tag = f" | detector: {args.ap_detector} | gpus: {args.ap_gpus}"
     elif args.pose == "mediapipe":
         tag = f" | stride: {args.pose_stride}"
-    print(f"videos: {len(videos)} | pose mode: {args.pose}{tag}")
-
-    detectors = None
-    if args.pose == "mediapipe":
-        detectors = build_mp_detectors(args.tmp)
 
     meta_path = os.path.join(args.out, "meta.csv")
     write_header = not os.path.exists(meta_path)
@@ -450,43 +489,57 @@ def main():
         writer = csv.DictWriter(f, fieldnames=["clip", "category"])
         if write_header:
             writer.writeheader()
-        for vi, (category, video) in enumerate(videos):
-            name = os.path.splitext(os.path.basename(video))[0]
-            # Skip corrupt / truncated downloads. yt-dlp sometimes reports success
-            # for a broken file (e.g. a 51 KB "video") that ffmpeg cannot decode;
-            # without this guard one bad file crashes the whole batch.
-            try:
-                size = os.path.getsize(video)
-            except OSError:
-                size = 0
-            if size < 200 * 1024:
-                print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped "
-                      f"(bad download, {size} bytes)")
-                continue
-            # Never let a single unreadable video kill the run: skip and continue.
-            try:
-                if args.pose == "alphapose":
-                    frames, pose, crops = extract_video_alphapose(video, args)
-                elif args.pose == "mediapipe":
-                    frames, pose, crops = extract_video_mediapipe(video, args, detectors)
-                else:
-                    # zeros: still need frames for context + timing
-                    frames_dir = os.path.join(args.tmp, "frames", name)
-                    os.makedirs(frames_dir, exist_ok=True)
-                    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-                        sh(["ffmpeg", "-y", "-i", video, "-vf",
-                            f"fps={args.fps},scale=-2:480", os.path.join(frames_dir, "%06d.jpg")])
-                    frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-                    pose, crops = None, None
-            except Exception as e:
-                print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped "
-                      f"({type(e).__name__}: {e})")
-                continue
-            if not frames:
-                print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped (no frames)")
-                continue
-            n = segment_and_write(name, category, video, frames, pose, crops, args, writer)
-            print(f"[{vi+1}/{len(videos)}] {category}/{name}: {n} clips")
+
+        if args.download:
+            # ---- STREAMING mode: download ONE video, process it, then DELETE it ----
+            # Peak disk stays at ~one source video at a time; only the small processed
+            # outputs (audio/pose/frames) are kept. This is what lets the full MUSIC-21
+            # set be preprocessed on Kaggle without overflowing storage.
+            if not cat_ids:
+                raise SystemExit("--download requires --json")
+            os.makedirs(args.videos_root, exist_ok=True)
+            pairs = []
+            for cat, ids in cat_ids.items():
+                todo = ids[:args.max_per_cat] if args.max_per_cat else ids
+                for vid in todo:
+                    pairs.append((cat, vid))
+            if args.max_videos:
+                pairs = pairs[:args.max_videos]
+            if not pairs:
+                raise SystemExit("no video ids found in --json")
+            print(f"videos: {len(pairs)} (streaming) | pose mode: {args.pose}{tag} | "
+                  f"keep_videos: {args.keep_videos}")
+            for vi, (category, vid) in enumerate(pairs):
+                # download just this one id (skips if already on disk)
+                download_videos({category: [vid]}, args.videos_root, max_per_cat=0,
+                                height=args.dl_height, cookiefile=args.cookiefile or None)
+                found = glob.glob(os.path.join(args.videos_root, category, vid + ".*"))
+                video = found[0] if found else None
+                if not video:
+                    print(f"[{vi+1}/{len(pairs)}] {category}/{vid}: skipped (unavailable)")
+                    continue
+                name = os.path.splitext(os.path.basename(video))[0]
+                process_one(vi, len(pairs), category, video, args, detectors, writer)
+                # free disk immediately: drop the source video + its temp files
+                if not args.keep_videos:
+                    try:
+                        os.remove(video)
+                    except OSError:
+                        pass
+                cleanup_tmp(name, args)
+        else:
+            # ---- on-disk mode: videos already present under --videos_root ----
+            # (source videos are left in place; only temp files are cleaned)
+            videos = find_videos_by_category(args.videos_root, cat_ids)
+            if args.max_videos:
+                videos = videos[:args.max_videos]
+            if not videos:
+                raise SystemExit(f"no videos found under {args.videos_root}")
+            print(f"videos: {len(videos)} | pose mode: {args.pose}{tag}")
+            for vi, (category, video) in enumerate(videos):
+                name = os.path.splitext(os.path.basename(video))[0]
+                process_one(vi, len(videos), category, video, args, detectors, writer)
+                cleanup_tmp(name, args)
     print("meta.csv written ->", meta_path)
 
 
