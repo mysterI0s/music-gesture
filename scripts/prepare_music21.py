@@ -144,8 +144,85 @@ def find_videos_by_category(videos_root, cat_ids=None):
     return out
 
 
+class AlphaPoseWorker:
+    """Persistent AlphaPose process: loads the YOLO detector + pose model ONCE
+    and answers many frame-dir requests over a pipe, instead of reloading both
+    models for every video (the ~10 s/video overhead visible as repeated
+    'Loading YOLO model..' / 'Loading pose model...' lines). run_alphapose
+    disables it automatically on any error, so a version mismatch just falls
+    back to the per-video subprocess."""
+    READY = "__AP_READY__"
+    RESULT = "__AP_RESULT__"
+
+    def __init__(self, args):
+        self.args = args
+        self.proc = None
+
+    def start(self):
+        worker_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "alphapose_worker.py")
+        if not os.path.exists(worker_py):
+            raise FileNotFoundError(worker_py)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = (self.args.alphapose_root + os.pathsep
+                             + env.get("PYTHONPATH", ""))
+        cmd = ["python", worker_py,
+               "--cfg", self.args.ap_cfg, "--checkpoint", self.args.ap_ckpt,
+               "--detector", self.args.ap_detector, "--gpus", self.args.ap_gpus]
+        self.proc = subprocess.Popen(
+            cmd, cwd=self.args.alphapose_root, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        for line in self.proc.stdout:
+            if line.startswith(self.READY):
+                return self
+        raise RuntimeError("AlphaPose worker did not become ready")
+
+    def infer(self, frames_dir):
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError("AlphaPose worker is not running")
+        outdir = os.path.join(self.args.tmp, "_ap",
+                              os.path.basename(frames_dir.rstrip("/")))
+        os.makedirs(outdir, exist_ok=True)
+        self.proc.stdin.write(json.dumps({"indir": frames_dir,
+                                          "outdir": outdir}) + "\n")
+        self.proc.stdin.flush()
+        for line in self.proc.stdout:
+            if line.startswith(self.RESULT):
+                resp = json.loads(line[len(self.RESULT):].strip())
+                if not resp.get("ok"):
+                    raise RuntimeError(resp.get("error", "worker error"))
+                return os.path.join(outdir, "alphapose-results.json")
+        raise RuntimeError("AlphaPose worker closed unexpectedly")
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+            self.proc.stdin.flush()
+            self.proc.wait(timeout=10)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+
+
 # ---------- AlphaPose (RMPE) : paper-faithful GPU wholebody ----------
 def run_alphapose(frames_dir, args):
+    worker = getattr(args, "_ap_worker", None)
+    if worker is not None:
+        try:
+            return worker.infer(frames_dir)
+        except Exception as e:
+            print(f"  [ap-worker] failed ({type(e).__name__}: {e}); "
+                  f"falling back to per-video subprocess")
+            try:
+                worker.close()
+            except Exception:
+                pass
+            args._ap_worker = None
     outdir = os.path.join(args.tmp, "_ap", os.path.basename(frames_dir.rstrip("/")))
     os.makedirs(outdir, exist_ok=True)
     demo = os.path.join(args.alphapose_root, "scripts", "demo_inference.py")
@@ -194,30 +271,18 @@ def _halpe_to_J(kp, x0, y0, bw_, bh_, size):
     return J
 
 
-def extract_video_alphapose(video, args):
-    """Solo backend: AlphaPose Halpe-136 on every frame, keep the single
-    highest-confidence person per frame. Returns (frame_paths, pose[T,60,3],
-    crops[list])."""
-    name = os.path.splitext(os.path.basename(video))[0]
-    frames_dir = os.path.join(args.tmp, "frames", name)
-    os.makedirs(frames_dir, exist_ok=True)
-    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-        extract_frames(video, frames_dir, args)
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-    T = len(frame_paths)
-    size = args.frame_size
-    if T == 0:
-        return [], None, None
-
-    results = run_alphapose(frames_dir, args)
+def _alphapose_pose_from_results(results, frame_paths, args):
+    """Map an alphapose-results.json onto pose[T,60,3] + crops[T] for the given
+    ordered frame_paths, keeping the single highest-confidence person per frame."""
     data = json.load(open(results))
+    size = args.frame_size
+    T = len(frame_paths)
     idx_of = {os.path.basename(fp): t for t, fp in enumerate(frame_paths)}
     by_frame = defaultdict(list)
     for e in data:
         t = idx_of.get(os.path.basename(str(e.get("image_id", ""))))
         if t is not None:
             by_frame[t].append(e)
-
     pose = np.zeros((T, VJ, 3), np.float32)
     crops = [None] * T
     for t in range(T):
@@ -238,10 +303,131 @@ def extract_video_alphapose(video, args):
         crop = bgr[y0:y1, x0:x1]
         if crop.size:
             crop_rs = cv2.resize(crop, (size, size))
-            cpath = os.path.join(frames_dir, f"crop_{t:06d}.jpg")
+            cpath = os.path.join(os.path.dirname(frame_paths[t]), f"crop_{t:06d}.jpg")
             cv2.imwrite(cpath, crop_rs)
             crops[t] = cpath
+    return pose, crops
+
+
+def extract_video_alphapose(video, args):
+    """Solo backend: AlphaPose Halpe-136 on every frame, keep the single
+    highest-confidence person per frame. Returns (frame_paths, pose[T,60,3],
+    crops[list])."""
+    name = os.path.splitext(os.path.basename(video))[0]
+    frames_dir = os.path.join(args.tmp, "frames", name)
+    os.makedirs(frames_dir, exist_ok=True)
+    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
+        extract_frames(video, frames_dir, args)
+    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    T = len(frame_paths)
+    size = args.frame_size
+    if T == 0:
+        return [], None, None
+
+    results = run_alphapose(frames_dir, args)
+    pose, crops = _alphapose_pose_from_results(results, frame_paths, args)
     return frame_paths, pose, crops
+
+
+def select_windows(wav, args):
+    """Choose up to args.max_clips_per_video clip windows SPREAD across the whole
+    track, skipping (near-)silent windows. Returns sorted start-seconds.
+
+    This is the key difference from a naive 'first N clips' cap: concert intros,
+    tuning, applause and silent gaps are NOT over-sampled -- clips are drawn from
+    voiced regions across the entire video, so the dataset stays representative.
+    """
+    sr = args.sr
+    clip_len = int(args.clip_seconds * sr)
+    if len(wav) < clip_len:
+        return []
+    cands = []
+    s = 0
+    while s + clip_len <= len(wav):
+        seg = wav[s:s + clip_len].astype(np.float64)
+        rms = float(np.sqrt(np.mean(seg * seg)) + 1e-9)
+        cands.append((s / sr, rms))
+        s += clip_len  # non-overlapping candidate tiles across the whole video
+    if not cands:
+        return []
+    voiced = [c for c in cands if c[1] >= args.min_rms]
+    pool = voiced if voiced else cands  # if the whole clip is quiet, keep it
+    N = args.max_clips_per_video
+    if N <= 0 or len(pool) <= N:
+        return [round(c[0], 3) for c in pool]
+    # pick N positions evenly spaced across the surviving (voiced) tiles
+    idxs = sorted(set(int(i) for i in np.linspace(0, len(pool) - 1, N).round()))
+    return [round(pool[i][0], 3) for i in idxs]
+
+
+def process_alphapose_windows(vi, total, category, video, args, writer):
+    """Sampled-window AlphaPose path (used when --max_clips_per_video > 0).
+    Extracts frames for only a handful of windows spread across the video and
+    poses them in ONE AlphaPose call, so a long concert costs a fraction of a
+    full-video pass and clips come from voiced regions -- never just the intro.
+    """
+    name = os.path.splitext(os.path.basename(video))[0]
+    # 1) full audio: needed both to pick voiced windows and to cut each clip wav
+    wav_path = os.path.join(args.tmp, name + ".wav")
+    if not os.path.exists(wav_path):
+        sh(["ffmpeg", "-y", "-i", video, "-ac", "1", "-ar", str(args.sr), wav_path])
+    wav, _ = sf.read(wav_path, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    starts = select_windows(wav, args)
+    if not starts:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no voiced audio)")
+        return 0
+    # 2) extract only the sampled windows' frames into one dir (prefixed so we
+    #    can regroup them after a single pose pass)
+    frames_dir = os.path.join(args.tmp, "frames", name)
+    os.makedirs(frames_dir, exist_ok=True)
+    for wi, start in enumerate(starts):
+        sh(["ffmpeg", "-y", "-ss", str(start), "-t", str(args.clip_seconds),
+            "-i", video, "-vf", f"fps={args.fps},scale=-2:480",
+            os.path.join(frames_dir, f"w{wi:03d}_%06d.jpg")])
+    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "w*.jpg")))
+    if not frame_paths:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no frames)")
+        return 0
+    # 3) ONE pose pass over all sampled frames
+    results = run_alphapose(frames_dir, args)
+    pose, crops = _alphapose_pose_from_results(results, frame_paths, args)
+    # 4) write one clip per window
+    clip_len = int(args.clip_seconds * args.sr)
+    seg_frames = args.num_frames
+    audio_dir = os.path.join(args.out, "audio")
+    pose_dir = os.path.join(args.out, "pose")
+    ctx_dir = os.path.join(args.out, "frames")
+    written = 0
+    for wi, start in enumerate(starts):
+        pref = f"w{wi:03d}_"
+        idxs = [t for t, fp in enumerate(frame_paths)
+                if os.path.basename(fp).startswith(pref)]
+        if len(idxs) < seg_frames // 2:
+            continue
+        idxs = idxs[:seg_frames]
+        a0 = int(round(start * args.sr))
+        a1 = a0 + clip_len
+        if a1 > len(wav):
+            continue
+        clip = f"{category}__{name}__s{wi:03d}"
+        sf.write(os.path.join(audio_dir, clip + ".wav"), wav[a0:a1], args.sr)
+        seg_pose = pose[idxs]
+        if len(seg_pose) < seg_frames:
+            seg_pose = np.pad(seg_pose,
+                              ((0, seg_frames - len(seg_pose)), (0, 0), (0, 0)))
+        np.save(os.path.join(pose_dir, clip + ".npy"), seg_pose.astype(np.float32))
+        cti = idxs[len(idxs) // 2] if args.context_frame == "middle" else idxs[0]
+        src_img = crops[cti] if crops[cti] else frame_paths[cti]
+        img = cv2.imread(src_img)
+        img = cv2.resize(img, (args.frame_size, args.frame_size))
+        cv2.imwrite(os.path.join(ctx_dir, clip + ".jpg"), img)
+        writer.writerow({"clip": clip, "category": category})
+        written += 1
+    print(f"[{vi+1}/{total}] {category}/{name}: {written} clips "
+          f"(sampled {len(starts)} windows across the video)")
+    return written
 
 
 # ---------- MediaPipe CPU fallback (single person) ----------
@@ -422,6 +608,9 @@ def process_one(vi, total, category, video, args, detectors, writer):
         return 0
     try:
         if args.pose == "alphapose":
+            if args.max_clips_per_video > 0:
+                return process_alphapose_windows(vi, total, category, video,
+                                                 args, writer)
             frames, pose, crops = extract_video_alphapose(video, args)
         elif args.pose == "mediapipe":
             frames, pose, crops = extract_video_mediapipe(video, args, detectors)
@@ -464,9 +653,21 @@ def main():
     ap.add_argument("--max_per_cat", type=int, default=0, help="0 = all ids per category (download)")
     ap.add_argument("--max_videos", type=int, default=0, help="0 = all videos (preprocess)")
     ap.add_argument("--max_clips_per_video", type=int, default=0,
-                    help="0 = whole video. Set e.g. 6 to only decode/pose the first "
-                         "N clips' worth of each video -- the biggest speed lever, "
-                         "since pose no longer runs on every frame of long videos.")
+                    help="0 = whole video. Set e.g. 6 to keep up to N clips per video, "
+                         "SAMPLED evenly across the WHOLE video and skipping "
+                         "(near-)silent windows (see --min_rms) -- NOT the first N. "
+                         "Biggest speed lever: pose runs on ~N*num_frames frames "
+                         "instead of every frame of a long concert (alphapose only).")
+    ap.add_argument("--min_rms", type=float, default=0.01,
+                    help="skip candidate windows whose audio RMS (float32 wav in "
+                         "[-1,1]) is below this, so silent concert intros/gaps are "
+                         "not sampled. Only used with --max_clips_per_video.")
+    ap.add_argument("--no_persistent_ap", dest="persistent_ap",
+                    action="store_false",
+                    help="disable the persistent AlphaPose worker and load the "
+                         "models per video (slower; use only if the worker errors "
+                         "on your AlphaPose build).")
+    ap.set_defaults(persistent_ap=True)
     ap.add_argument("--shard", default="",
                     help="process only shard idx/count of the video list, e.g. '0/2'. "
                          "Run two processes (one per GPU) to use both T4s; each writes "
@@ -508,6 +709,18 @@ def main():
     detectors = None
     if args.pose == "mediapipe":
         detectors = build_mp_detectors(args.tmp)
+
+    # Persistent AlphaPose worker: load detector + pose model ONCE for the whole
+    # run instead of per video. Auto-falls back to the per-video subprocess.
+    args._ap_worker = None
+    if args.pose == "alphapose" and args.persistent_ap:
+        try:
+            args._ap_worker = AlphaPoseWorker(args).start()
+            print("AlphaPose persistent worker: ready (models loaded once)")
+        except Exception as e:
+            print(f"AlphaPose persistent worker unavailable "
+                  f"({type(e).__name__}: {e}); using per-video subprocess")
+            args._ap_worker = None
 
     tag = ""
     if args.pose == "alphapose":
@@ -578,6 +791,8 @@ def main():
                 process_one(vi, len(videos), category, video, args, detectors, writer)
                 cleanup_tmp(name, args)
     print("meta.csv written ->", meta_path)
+    if getattr(args, "_ap_worker", None) is not None:
+        args._ap_worker.close()
 
 
 if __name__ == "__main__":
