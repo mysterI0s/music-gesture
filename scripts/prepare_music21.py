@@ -448,17 +448,15 @@ def build_mp_detectors(cache):
     return mp, pose, hands
 
 
-def extract_video_mediapipe(video, args, detectors):
-    name = os.path.splitext(os.path.basename(video))[0]
-    frames_dir = os.path.join(args.tmp, "frames", name)
-    os.makedirs(frames_dir, exist_ok=True)
-    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-        extract_frames(video, frames_dir, args)
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+def _mediapipe_pose_for_frames(frame_paths, detectors, args):
+    """Run MediaPipe pose+hands over the ordered frame_paths and return
+    (pose[T,60,3], crops[T]). Shared by the full-video path
+    (extract_video_mediapipe) and the sampled-window path
+    (process_mediapipe_windows) so both keep identical keypoint semantics."""
     T = len(frame_paths)
     size = args.frame_size
     if T == 0:
-        return [], None, None
+        return None, None
     mp, pose_det, hand_det = detectors
     pose = np.zeros((T, VJ, 3), np.float32)
     crops = [None] * T
@@ -495,7 +493,7 @@ def extract_video_mediapipe(video, args, detectors):
         crop = bgr[y0:y1, x0:x1]
         if crop.size:
             crop_rs = cv2.resize(crop, (size, size))
-            cpath = os.path.join(frames_dir, f"crop_{t:06d}.jpg")
+            cpath = os.path.join(os.path.dirname(frame_paths[t]), f"crop_{t:06d}.jpg")
             cv2.imwrite(cpath, crop_rs)
             crops[t] = cpath
             himg = mp.Image(image_format=mp.ImageFormat.SRGB,
@@ -528,7 +526,95 @@ def extract_video_mediapipe(video, args, detectors):
                 nxt = crops[t]
             elif nxt is not None:
                 crops[t] = nxt
+    return pose, crops
+
+
+def extract_video_mediapipe(video, args, detectors):
+    name = os.path.splitext(os.path.basename(video))[0]
+    frames_dir = os.path.join(args.tmp, "frames", name)
+    os.makedirs(frames_dir, exist_ok=True)
+    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
+        extract_frames(video, frames_dir, args)
+    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    if not frame_paths:
+        return [], None, None
+    pose, crops = _mediapipe_pose_for_frames(frame_paths, detectors, args)
     return frame_paths, pose, crops
+
+
+def process_mediapipe_windows(vi, total, category, video, args, detectors, writer):
+    """Sampled-window MediaPipe path (used when --max_clips_per_video > 0).
+    Mirrors process_alphapose_windows: pick voiced windows spread across the whole
+    track (select_windows / --min_rms), extract only those windows' frames, run
+    MediaPipe pose+hands on them, and write one clip per window -- so silent
+    concert intros/gaps are not over-sampled and a long video costs a fraction of
+    a full-video pass. This is the MediaPipe fix for the same RMS problem the
+    AlphaPose path already solved.
+    """
+    name = os.path.splitext(os.path.basename(video))[0]
+    # 1) full audio: needed both to pick voiced windows and to cut each clip wav
+    wav_path = os.path.join(args.tmp, name + ".wav")
+    if not os.path.exists(wav_path):
+        sh(["ffmpeg", "-y", "-i", video, "-ac", "1", "-ar", str(args.sr), wav_path])
+    wav, _ = sf.read(wav_path, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    starts = select_windows(wav, args)
+    if not starts:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no voiced audio)")
+        return 0
+    # 2) extract only the sampled windows' frames (prefixed per window so we can
+    #    regroup them after a single pose pass)
+    frames_dir = os.path.join(args.tmp, "frames", name)
+    os.makedirs(frames_dir, exist_ok=True)
+    for wi, start in enumerate(starts):
+        sh(["ffmpeg", "-y", "-ss", str(start), "-t", str(args.clip_seconds),
+            "-i", video, "-vf", f"fps={args.fps},scale=-2:480",
+            os.path.join(frames_dir, f"w{wi:03d}_%06d.jpg")])
+    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "w*.jpg")))
+    if not frame_paths:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no frames)")
+        return 0
+    # 3) ONE MediaPipe pass over all sampled frames
+    pose, crops = _mediapipe_pose_for_frames(frame_paths, detectors, args)
+    if pose is None:
+        print(f"[{vi+1}/{total}] {category}/{name}: skipped (no frames)")
+        return 0
+    # 4) write one clip per window
+    clip_len = int(args.clip_seconds * args.sr)
+    seg_frames = args.num_frames
+    audio_dir = os.path.join(args.out, "audio")
+    pose_dir = os.path.join(args.out, "pose")
+    ctx_dir = os.path.join(args.out, "frames")
+    written = 0
+    for wi, start in enumerate(starts):
+        pref = f"w{wi:03d}_"
+        idxs = [t for t, fp in enumerate(frame_paths)
+                if os.path.basename(fp).startswith(pref)]
+        if len(idxs) < seg_frames // 2:
+            continue
+        idxs = idxs[:seg_frames]
+        a0 = int(round(start * args.sr))
+        a1 = a0 + clip_len
+        if a1 > len(wav):
+            continue
+        clip = f"{category}__{name}__s{wi:03d}"
+        sf.write(os.path.join(audio_dir, clip + ".wav"), wav[a0:a1], args.sr)
+        seg_pose = pose[idxs]
+        if len(seg_pose) < seg_frames:
+            seg_pose = np.pad(seg_pose,
+                              ((0, seg_frames - len(seg_pose)), (0, 0), (0, 0)))
+        np.save(os.path.join(pose_dir, clip + ".npy"), seg_pose.astype(np.float32))
+        cti = idxs[len(idxs) // 2] if args.context_frame == "middle" else idxs[0]
+        src_img = crops[cti] if crops[cti] else frame_paths[cti]
+        img = cv2.imread(src_img)
+        img = cv2.resize(img, (args.frame_size, args.frame_size))
+        cv2.imwrite(os.path.join(ctx_dir, clip + ".jpg"), img)
+        writer.writerow({"clip": clip, "category": category})
+        written += 1
+    print(f"[{vi+1}/{total}] {category}/{name}: {written} clips "
+          f"(sampled {len(starts)} windows across the video)")
+    return written
 
 
 # ---------- segmentation / writing ----------
@@ -613,6 +699,9 @@ def process_one(vi, total, category, video, args, detectors, writer):
                                                  args, writer)
             frames, pose, crops = extract_video_alphapose(video, args)
         elif args.pose == "mediapipe":
+            if args.max_clips_per_video > 0:
+                return process_mediapipe_windows(vi, total, category, video,
+                                                 args, detectors, writer)
             frames, pose, crops = extract_video_mediapipe(video, args, detectors)
         else:
             # zeros: still need frames for context + timing
@@ -657,7 +746,8 @@ def main():
                          "SAMPLED evenly across the WHOLE video and skipping "
                          "(near-)silent windows (see --min_rms) -- NOT the first N. "
                          "Biggest speed lever: pose runs on ~N*num_frames frames "
-                         "instead of every frame of a long concert (alphapose only).")
+                         "instead of every frame of a long concert (alphapose and "
+                         "mediapipe).")
     ap.add_argument("--min_rms", type=float, default=0.01,
                     help="skip candidate windows whose audio RMS (float32 wav in "
                          "[-1,1]) is below this, so silent concert intros/gaps are "
